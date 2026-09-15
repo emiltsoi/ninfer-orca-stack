@@ -1,0 +1,56 @@
+[
+  {
+    "tag": "code",
+    "completion_tokens": 700,
+    "decode_tps": 159.1,
+    "prompt_tps": 858.4,
+    "draft_n": 1134,
+    "draft_accepted": 472,
+    "wall_s": 4.5
+  },
+  {
+    "tag": "json",
+    "completion_tokens": 882,
+    "decode_tps": 246.7,
+    "prompt_tps": 1579.9,
+    "draft_n": 920,
+    "draft_accepted": 700,
+    "wall_s": 3.7
+  },
+  {
+    "tag": "reason",
+    "completion_tokens": 253,
+    "decode_tps": 244.1,
+    "prompt_tps": 1529.1,
+    "draft_n": 265,
+    "draft_accepted": 203,
+    "wall_s": 1.1
+  },
+  {
+    "tag": "story",
+    "completion_tokens": 316,
+    "decode_tps": 107.5,
+    "prompt_tps": 997.5,
+    "draft_n": 755,
+    "draft_accepted": 167,
+    "wall_s": 3.0
+  },
+  {
+    "tag": "summ",
+    "completion_tokens": 214,
+    "decode_tps": 215.5,
+    "prompt_tps": 1533.2,
+    "draft_n": 255,
+    "draft_accepted": 165,
+    "wall_s": 1.1
+  },
+  {
+    "tag": "toolcall",
+    "completion_tokens": 400,
+    "decode_tps": 178.6,
+    "prompt_tps": 1499.3,
+    "draft_n": 565,
+    "draft_accepted": 284,
+    "wall_s": 2.3
+  }
+]

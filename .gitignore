@@ -1,0 +1,20 @@
+# Logs and runtime state
+*.log
+ninfer-ctl.log
+ninfer-child.log
+ninfer-req.log
+
+# Model artifacts (huge, downloaded separately — see docs/MIGRATION.md)
+*.ninfer
+models/
+build/apps/
+ffmpeg/
+
+# Local overrides / secrets — never commit real paths, IPs, or keys
+.env
+*.local.*
+secrets.*
+
+# OS / editor noise
+Thumbs.db
+__pycache__/
