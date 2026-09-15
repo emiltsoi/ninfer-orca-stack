@@ -86,14 +86,14 @@ Two surprises from measuring rather than assuming:
 
 Same controller pattern as llama-ctl, rebuilt for NInfer: [`ninfer-ctl.js`](controller/ninfer-ctl.js) on `:11434`, child on loopback `:11435`, serialized swaps, `/yield` to free everything, `/health`, digest request log. Boot is ~6 s, so swapping profiles is cheap.
 
-Four VRAM-matched profiles (~2.7–3.2 GiB free each):
+Four VRAM-matched profiles, all running `--max-concurrency 2` (~2.2–2.5 GiB free each at C=2):
 
-| Alias | Spec | Vision | Context |
-|---|---|---|---|
-| `qwen-3.8-orca` | MTP | – | 315k (YaRN 1.25) |
-| `qwen-3.8-orca-fast` | DFlash2 | – | 230k native |
-| `qwen-3.8-orca-vision` | MTP | ✓ | 288k (YaRN 1.25) |
-| `qwen-3.8-orca-vision-fast` | DFlash2 | ✓ | 200k native |
+| Alias | Spec | Vision | Context | KV pool |
+|---|---|---|---|---|
+| `qwen-3.8-orca` | MTP | – | 315k (YaRN 1.25) | 315,008 |
+| `qwen-3.8-orca-fast` | DFlash2 | – | 230k native | 230,016 |
+| `qwen-3.8-orca-vision` | MTP | ✓ | 288k (YaRN 1.25) | 288,000 |
+| `qwen-3.8-orca-vision-fast` | DFlash2 | ✓ | 200k native | 200,000 |
 
 Legacy `qwen38-orca*` names remap to the closest profile, and NInfer echoes whatever model string the client sent — zero client reconfiguration. All four verified live: completions on text profiles, "Red" on a red-square image for both vision profiles.
 
@@ -134,7 +134,25 @@ Two durable rules from this:
 - **Clients only ever touch `:11434`** (the controller). Direct `:11435` access would silently bypass alias routing — you get whatever profile happens to be loaded, which is a wrong-model bug waiting to happen, not a shortcut.
 - If an aux/fast lane is wanted, the answer is an *alias* (`qwen-3.8-orca-fast`) on the public port, or a second controller port — never the internal port.
 
-## Gotchas learned the hard way
+## Concurrency 2 — and the `--kv-capacity auto` trap
+
+All four profiles now run `--max-concurrency 2` (NInfer supports 1–8, startup-fixed; one decode batch per round, bounded FIFO ingress, no preemption). Probed empirically; two surprises worth recording:
+
+- **`--kv-capacity auto` is greedy.** With it, the engine expands the KV pool to soak *all* free VRAM — at C=2 on the orca profile it allocated 472k tokens of KV and reported **147 MiB free**. Booted, but one desktop hiccup from death. Fix: pin `--kv-capacity` explicitly per profile (each profile now carries a `kv` field, page-aligned to 64).
+- **The pool is shared across slots.** With C=2 and `kv = ctx`, two in-flight requests must fit the pool *combined* — a 315k-pool can host a 200k + 110k pair, or one big request while a small aux runs alongside. A pair exceeding the pool queues at admission (same as C=1, no preemption). Per-request `--max-context` is unchanged — a single request can still use the whole window.
+
+Measured at C=2 (pinned kv, vs ~2.7–3.2 GiB free at C=1 — the second slot costs ~0.5–0.9 GiB of runtime reserve):
+
+| Profile | KV pool | Runtime | Free @C=2 |
+|---|---|---|---|
+| orca | 315,008 | 6.67 GiB | 2.34 GiB |
+| orca-fast | 230,016 | 5.86 GiB | 2.22 GiB |
+| orca-vision | 288,000 | 6.83 GiB | 2.50 GiB |
+| orca-vision-fast | 200,000 | 6.00 GiB | 2.45 GiB |
+
+Real-concurrency proof (child log): `req#1 started` and `req#2 started` in the same millisecond, `batch 1.53` average, decodes overlapped at 327 t/s and 180 t/s — genuine parallel decode, not queueing.
+
+## Ops cheat sheet
 
 ```
 start:  <ops-dir>\ninfer-ctl-start.bat   (detached)
@@ -149,6 +167,7 @@ Standalone single-profile launchers remain in the repo (`ninfer-start.bat`, `nin
 ## Gotchas learned the hard way
 
 - `ninfer-serve` startup check is stricter than steady-state: it wants reserve + 1 GiB *before* it starts. A config that ran yesterday can fail today if the desktop's using more VRAM. If boot fails, check `ninfer-serve.log` for the `available after weights` number.
+- Never combine `--max-concurrency ≥2` with `--kv-capacity auto` — the pool grows to eat all free VRAM (see "Concurrency 2"). Always pin `--kv-capacity` per profile.
 - Detached `cmd /c` spawns can lag — a "failed" launch produced a zombie that bound the port a minute later. Always check the port owner, not just the PID you meant to kill.
 - `python` on this box is Python 2.7. Use `py -3` (3.14) for scripts.
 - NInfer rejects what llama.cpp tolerated: no `/v1/completions`, `/v1/embeddings`, JSON mode, `n>1`, logprobs, or forced `tool_choice` — and `reasoning_effort` is gated to `none`/`low`/`medium`/`xhigh` (the router rewrites `minimal`/`high`/`max`). It *does* accept `seed` and returns rich `timings` (decode t/s, draft acceptance) per response.

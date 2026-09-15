@@ -21,7 +21,7 @@
  *   NINFER_PORT        — public listen port        (default 11434)
  *   NINFER_CHILD_PORT  — loopback child port       (default 11435)
  *
- * Profiles below are VRAM-matched (~2.7–3.2 GiB free) on an RTX 5090 32 GB
+ * Profiles below are VRAM-matched (~2.2–2.5 GiB free @C=2) on an RTX 5090 32 GB
  * with ~3 GiB of desktop WDDM usage. KV is ~18.9 KiB/token in NVFP4 — retune
  * ctx to taste; keep >=2 GiB free for desktop safety.
  */
@@ -45,28 +45,32 @@ const ART_MTP = path.join(MODEL_DIR, 'qwen3_8_27b_orca_nvfp4.ninfer');
 const ART_DF2 = path.join(MODEL_DIR, 'qwen3_8_27b_orca_nvfp4_dflash2.ninfer');
 
 // ---- Profile registry: alias -> launch config ----
-// { artifact, ctx, extra[] } — ctx drives both --max-context and /v1/models
+// { artifact, ctx, kv, extra[] } — ctx drives both --max-context and /v1/models
 // advertising (agents read context_length/max_model_len to size requests).
-const COMMON = ['--kv-capacity', 'auto', '--max-concurrency', '1', '--kv-dtype', 'nvfp4', '--cors'];
+// kv pins --kv-capacity (64-token page aligned): at concurrency 2 the pool is
+// shared, so two in-flight requests must fit kv tokens combined. 'auto' would
+// let the engine greedily expand the pool to ~all free VRAM (measured: 147 MiB
+// free at C=2/orca — unsafe under WDDM desktop pressure).
+const COMMON = ['--max-concurrency', '2', '--kv-dtype', 'nvfp4', '--cors'];
 const YARN125 = ['--rope-yarn-factor', '1.25', '--rope-original-max-position', '262144'];
 const MTP = ['--spec', 'mtp', '--draft-tokens', '5', '--lm-head-draft'];
 const DF2 = ['--spec', 'dflash2', '--draft-tokens', '7', '--lm-head-draft'];
 
 const MODELS = {
   'qwen-3.8-orca': {
-    artifact: ART_MTP, ctx: 315000,
+    artifact: ART_MTP, ctx: 315000, kv: 315008,
     extra: [...COMMON, ...MTP, ...YARN125],
   },
   'qwen-3.8-orca-fast': {
-    artifact: ART_DF2, ctx: 230000,
+    artifact: ART_DF2, ctx: 230000, kv: 230016,
     extra: [...COMMON, ...DF2],
   },
   'qwen-3.8-orca-vision': {
-    artifact: ART_MTP, ctx: 288000,
+    artifact: ART_MTP, ctx: 288000, kv: 288000,
     extra: ['--vision', ...COMMON, ...MTP, ...YARN125],
   },
   'qwen-3.8-orca-vision-fast': {
-    artifact: ART_DF2, ctx: 200000,
+    artifact: ART_DF2, ctx: 200000, kv: 200000,
     extra: ['--vision', ...COMMON, ...DF2],
   },
 };
@@ -184,7 +188,7 @@ async function loadModelInner(alias) {
   await waitPortFree();
 
   const args = [cfg.artifact, '--host', '127.0.0.1', '--port', String(CHILD_PORT),
-                '--max-context', String(cfg.ctx), ...cfg.extra];
+                '--max-context', String(cfg.ctx), '--kv-capacity', String(cfg.kv), ...cfg.extra];
 
   const childLogFd = fs.openSync(CHILD_LOG, 'a');
   fs.writeSync(childLogFd, `\n===== spawn ${alias} @ ${new Date().toISOString()} =====\n`);
