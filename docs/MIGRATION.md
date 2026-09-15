@@ -14,6 +14,12 @@ Two things killed it. Operationally, the registry had rotted — a Downloads cle
 
 Published numbers claimed ~210 tok/s decode with MTP5 and up to ~356 with DFlash2 — 3–5× llama.cpp. That was worth chasing.
 
+### Aside: flash attention is already the only path
+
+One question carried over from llama.cpp habits: "does it support flash attention?" There is no `--flash-attn` flag — because there's no non-flash path. NInfer doesn't link FlashAttention-the-library; its `softmax_attention` kernels implement the same algorithm by hand for `sm_120a`: KV streams through in 64-token tiles under **online softmax** (running max `m`, running sum `l`, rescale `alpha` in shared memory — `src/ops/softmax_attention/dense/causal_cache/prompt_fp8.cuh`), so the S×S score matrix never exists.
+
+The part llama.cpp can't do: the flash tiling is **fused with KV dequantization** — each fp8/nvfp4/k8v4 tile is dequantized inline mid-attention with per-row scales. Attention bandwidth therefore scales with the *compressed* cache, which is part of why decode holds ~200 tok/s at 200k+ context. Separate `prompt_*` (prefill) and `small_t_*` (decode) kernel families exist per KV dtype, plus a `sliding_window/` path for the DFlash2 draft's conv-window attention.
+
 ## Porting YaRN to Windows
 
 One gap: the Windows fork capped `--max-context` at the model's native 262,144. The sister fork [`splickz/ninfer-yarn-nvfp4`](https://github.com/splickz/ninfer-yarn-nvfp4) had YaRN RoPE scaling — but Linux/WSL2 only.
