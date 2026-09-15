@@ -117,7 +117,18 @@ The router now serves its own listing: each profile entry carries a single `ctx`
 
 Same lesson as the reasoning-effort fix: the controller isn't a dumb pipe — it's where the product's external contract gets enforced.
 
-## Ops cheat sheet
+## The `:11435` incident — port topology is part of the contract
+
+A remote agent's gateway reported `ECONNREFUSED 127.0.0.1:11435` and (correctly) deduced "someone owns that port" — but misidentified the owner. `:11435` is the controller's **internal swap slot**: loopback-only on the rack by design, killed and respawned on every model change. It was never a client endpoint — in the old llama-ctl stack or this one.
+
+Their aux provider was configured to hit `127.0.0.1:11435` directly, which on their own host resolves to their own loopback → refuse → retry → fall back to the real `:11434`. Every aux call paid a ~2s tax. Nothing was wrong on the rack — request logs showed their main session landing fine.
+
+Two durable rules from this:
+
+- **Clients only ever touch `:11434`** (the controller). Direct `:11435` access would silently bypass alias routing — you get whatever profile happens to be loaded, which is a wrong-model bug waiting to happen, not a shortcut.
+- If an aux/fast lane is wanted, the answer is an *alias* (`qwen-3.8-orca-fast`) on the public port, or a second controller port — never the internal port.
+
+## Gotchas learned the hard way
 
 ```
 start:  <ops-dir>\ninfer-ctl-start.bat   (detached)
@@ -135,7 +146,9 @@ Standalone single-profile launchers remain in the repo (`ninfer-start.bat`, `nin
 - Detached `cmd /c` spawns can lag — a "failed" launch produced a zombie that bound the port a minute later. Always check the port owner, not just the PID you meant to kill.
 - `python` on this box is Python 2.7. Use `py -3` (3.14) for scripts.
 - NInfer rejects what llama.cpp tolerated: no `/v1/completions`, `/v1/embeddings`, JSON mode, `n>1`, logprobs, or forced `tool_choice` — and `reasoning_effort` is gated to `none`/`low`/`medium`/`xhigh` (the router rewrites `minimal`/`high`/`max`). It *does* accept `seed` and returns rich `timings` (decode t/s, draft acceptance) per response.
-- `/v1/models` advertises a 131k context cap for IDs containing "vision" — cosmetic clamp in `http_server.cpp`, not a real limit.
+- `/v1/models` advertises a 131k context cap for IDs containing "vision" — cosmetic clamp in `http_server.cpp`, not a real limit. (Our router serves its own listing anyway — see "Advertising context correctly".)
+- The controller watchdog's 10s health probe can false-positive while the child is mid-decode on a huge request — observed as `child unresponsive x2 - reloading` in `ninfer-ctl.log` during a heavy session. Harmless but wasteful (a swap costs ~7s); raise the probe timeout if it recurs.
+- The engine fork was renamed on GitHub to `emiltsoi/ninfer-5090-windows-yarn` (old `ninfer-5090-windows` URL redirects). Sanitized, env-var-driven copies of everything here live in `emiltsoi/ninfer-orca-stack`.
 
 ## What's deliberately *not* done
 
