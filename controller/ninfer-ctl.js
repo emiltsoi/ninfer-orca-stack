@@ -165,6 +165,21 @@ function loadModel(alias) {
   return next;
 }
 
+// Kill whatever owns the child port — orphaned children spawned by a
+// dead/restarted controller are unreachable via killChild() and a new spawn
+// dies on bind. MUST be awaited: powershell takes ~1s to start and evaluates
+// the port owner at exec time — fired async, it would kill our own
+// just-bound child.
+function killPortOwner() {
+  return new Promise((resolve) => {
+    const kp = spawn('powershell', ['-NoProfile', '-Command',
+      `(Get-NetTCPConnection -LocalPort ${CHILD_PORT} -State Listen -ErrorAction SilentlyContinue).OwningProcess | ForEach-Object { try { Stop-Process -Id $_ -Force } catch {} }`],
+      { stdio: 'ignore' });
+    kp.on('exit', resolve);
+    setTimeout(resolve, 15000);
+  });
+}
+
 async function loadModelInner(alias) {
   const cfg = MODELS[alias];
   if (!cfg) throw new Error('unknown model: ' + alias);
@@ -174,35 +189,54 @@ async function loadModelInner(alias) {
   }
 
   await killChild();
-  // Orphaned children (spawned by a dead/restarted controller) still hold the
-  // child port — our killChild() can't reach them and a new spawn dies on bind.
-  // MUST be awaited: powershell takes ~1s to start and evaluates the port owner
-  // at exec time — fired async, it would kill our own just-bound child.
-  await new Promise((resolve) => {
-    const kp = spawn('powershell', ['-NoProfile', '-Command',
-      `(Get-NetTCPConnection -LocalPort ${CHILD_PORT} -State Listen -ErrorAction SilentlyContinue).OwningProcess | ForEach-Object { try { Stop-Process -Id $_ -Force } catch {} }`],
-      { stdio: 'ignore' });
-    kp.on('exit', resolve);
-    setTimeout(resolve, 15000);
-  });
+  await killPortOwner();
   await waitPortFree();
 
   const args = [cfg.artifact, '--host', '127.0.0.1', '--port', String(CHILD_PORT),
                 '--max-context', String(cfg.ctx), '--kv-capacity', String(cfg.kv), ...cfg.extra];
 
-  const childLogFd = fs.openSync(CHILD_LOG, 'a');
-  fs.writeSync(childLogFd, `\n===== spawn ${alias} @ ${new Date().toISOString()} =====\n`);
-  child = spawn(NINFER_SERVE, args, { stdio: ['ignore', childLogFd, childLogFd], detached: false });
-  child.on('exit', (code) => {
-    try { fs.closeSync(childLogFd); } catch (e) {}
-    fs.appendFileSync(CHILD_LOG, `===== exit ${alias} code ${code} @ ${new Date().toISOString()} =====\n`);
-    child = null; currentModel = null;
-  });
-  currentModel = alias;
-  proxyTarget = 'http://127.0.0.1:' + CHILD_PORT;
+  // Boot: spawn + health-wait, but reject FAST if the child exits mid-boot —
+  // a startup FATAL (e.g. transient desktop VRAM pressure) must not stall the
+  // serialized queue for the full 90s health timeout. Retry after a delay:
+  // observed spikes clear within ~60-90s, so 3 attempts cover most cases.
+  const MAX_ATTEMPTS = 3, RETRY_DELAY_MS = 15000;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      console.log('ninfer-ctl: ' + alias + ' boot attempt ' + attempt + ' after ' + (lastErr && lastErr.message));
+      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+      await killPortOwner();
+      await waitPortFree();
+    }
 
-  loadingPromise = waitForHealth(proxyTarget);
-  try { await loadingPromise; } finally { loadingPromise = null; }
+    const childLogFd = fs.openSync(CHILD_LOG, 'a');
+    fs.writeSync(childLogFd, `\n===== spawn ${alias} (attempt ${attempt}) @ ${new Date().toISOString()} =====\n`);
+    child = spawn(NINFER_SERVE, args, { stdio: ['ignore', childLogFd, childLogFd], detached: false });
+    child.on('exit', (code) => {
+      try { fs.closeSync(childLogFd); } catch (e) {}
+      fs.appendFileSync(CHILD_LOG, `===== exit ${alias} code ${code} @ ${new Date().toISOString()} =====\n`);
+      child = null; currentModel = null;
+    });
+    currentModel = alias;
+    proxyTarget = 'http://127.0.0.1:' + CHILD_PORT;
+
+    const proc = child;
+    loadingPromise = new Promise((resolve, reject) => {
+      proc.once('exit', (code) => reject(new Error('ninfer-serve exited during boot (code ' + (code === null ? 'signal' : code) + ')')));
+      proc.once('error', (e) => reject(new Error('spawn failed: ' + e.message)));
+      waitForHealth(proxyTarget).then(resolve, reject);
+    });
+    try {
+      await loadingPromise;
+      return;
+    } catch (e) {
+      lastErr = e;
+      console.log('ninfer-ctl: ' + alias + ' boot attempt ' + attempt + ' failed: ' + e.message);
+    } finally {
+      loadingPromise = null;
+    }
+  }
+  throw lastErr;
 }
 
 // ---- Child health watchdog ----
