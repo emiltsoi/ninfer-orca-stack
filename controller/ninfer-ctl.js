@@ -40,9 +40,41 @@ const CHILD_LOG = path.join(LOG_DIR, 'ninfer-child.log');
 const REQ_LOG = path.join(LOG_DIR, 'ninfer-req.log');
 const NINFER_HOME = process.env.NINFER_HOME || path.resolve(__dirname, '..', '..', 'ninfer-5090-windows');
 const NINFER_SERVE = path.join(NINFER_HOME, 'build', 'apps', 'ninfer-serve.exe');
+// Consolidated 3090-line build (iamwavecut/ninfer-3090 master), compiled locally for
+// sm_120a on the compatibility path — the only line that loads T2G128 ternary artifacts.
+// It does NOT build the FP8/NVFP4 routes, so Orca profiles keep the stock binary.
+const NINFER_CONS_SERVE = process.env.NINFER_CONS_SERVE ||
+  path.resolve(__dirname, '..', '..', 'ninfer-consolidated', 'build', 'apps', 'ninfer-serve.exe');
+// ---- API key: unified across the local stacks (llm-ctl family) ----
+// Resolution order: LLM_API_KEY env -> NINFER_API_KEY env (per-stack
+// override) -> shared key file -> stack-local key file (legacy).
+// Key present => bind 0.0.0.0 and require Bearer/x-api-key on every route
+// except GET /health (open liveness). No key => loopback only, no auth.
+const SHARED_KEY_FILE = 'C:\\work\\localMachine\\llm-api-key.txt';
+const LOCAL_KEY_FILE = path.join(__dirname, 'ninfer-api-key.txt');
+function readKeyFile(f) {
+  try {
+    const line = fs.readFileSync(f, 'utf8').split('\n')
+      .map(s => s.trim()).filter(s => s && !s.startsWith('#'))[0];
+    return line || null;
+  } catch (e) { return null; }
+}
+const API_KEY = process.env.LLM_API_KEY || process.env.NINFER_API_KEY ||
+  readKeyFile(SHARED_KEY_FILE) || readKeyFile(LOCAL_KEY_FILE);
+const BIND = API_KEY ? '0.0.0.0' : '127.0.0.1';
+function authorized(req) {
+  if (!API_KEY) return true;
+  const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const k = bearer || req.headers['x-api-key'] || '';
+  return k.length === API_KEY.length &&
+    crypto.timingSafeEqual(Buffer.from(k), Buffer.from(API_KEY));
+}
+
 const MODEL_DIR = path.join(NINFER_HOME, 'models');
 const ART_MTP = path.join(MODEL_DIR, 'qwen3_8_27b_orca_nvfp4.ninfer');
 const ART_DF2 = path.join(MODEL_DIR, 'qwen3_8_27b_orca_nvfp4_dflash2.ninfer');
+const ART_BONSAI = path.join(MODEL_DIR, 'Ternary-Bonsai-2-27B-ninfer-v3.ninfer');
+const ART_BONSAI_HERETIC = path.join(MODEL_DIR, 'Ternary-Bonsai-2-27B-Heretic-ninfer.ninfer');
 
 // ---- Profile registry: alias -> launch config ----
 // { artifact, ctx, kv, extra[] } — ctx drives both --max-context and /v1/models
@@ -55,6 +87,28 @@ const COMMON = ['--max-concurrency', '2', '--kv-dtype', 'nvfp4', '--cors'];
 const YARN125 = ['--rope-yarn-factor', '1.25', '--rope-original-max-position', '262144'];
 const MTP = ['--spec', 'mtp', '--draft-tokens', '5', '--lm-head-draft'];
 const DF2 = ['--spec', 'dflash2', '--draft-tokens', '7', '--lm-head-draft'];
+
+// Bonsai profiles run the consolidated binary (t2_g128_fp16 + hadamard_signs exist only
+// there). kv-dtype differs: rk4v4-e8 is ~9.5 KiB/token, so the full 1,048,576-token
+// context fits at C=2 with ~2.5-3 GiB free (measured 22:56 boot: 18.0 GiB runtime,
+// 3.3 GiB free after the desktop pile was trimmed). Per the artifact card, DFlash2 takes
+// no --lm-head-draft (proposal head gains nothing there). No --rope-yarn: plain RoPE
+// needle-tested better than YaRN past the native 262,144 window on this model.
+// --default-thinking-budget 32768 (2026-10-14): past ~350k of prompt the model can fall
+// into exact-repeat reasoning loops; the cap force-closes thinking so the request still
+// yields an answer instead of burning the whole max_tokens budget on a loop.
+// --min-p 0.05 (2026-10-14): upstream card's thinking-mode value; the engine preset is
+// card-exact otherwise. Applies to both modes (flag is not per-mode), which is a slight
+// tightening over the card's non-thinking 0.0 — negligible under top-p 0.8.
+const BONSAI_DF2 = ['--model-id', 'bonsai2-27b', '--spec', 'dflash2', '--draft-tokens', '7',
+  '--kv-dtype', 'rk4v4-e8', '--gdn-state-fp16', '--max-concurrency', '2', '--cors',
+  '--default-thinking-budget', '32768', '--min-p', '0.05'];
+// Same flags, different reported id: the Heretic (abliterated) conversion is a
+// separate artifact built locally from OS-Software's ternary GGUF.
+const BONSAI_HERETIC_DF2 = ['--model-id', 'bonsai2-27b-heretic', '--spec', 'dflash2',
+  '--draft-tokens', '7', '--kv-dtype', 'rk4v4-e8', '--gdn-state-fp16',
+  '--max-concurrency', '2', '--cors', '--default-thinking-budget', '32768',
+  '--min-p', '0.05'];
 
 const MODELS = {
   'qwen-3.8-orca': {
@@ -72,6 +126,16 @@ const MODELS = {
   'qwen-3.8-orca-vision-fast': {
     artifact: ART_DF2, ctx: 200000, kv: 200000,
     extra: ['--vision', ...COMMON, ...DF2],
+  },
+  'bonsai2-27b-vision': {
+    artifact: ART_BONSAI, ctx: 1048576, kv: 1048576, serve: NINFER_CONS_SERVE,
+    reportedId: 'bonsai2-27b',
+    extra: ['--vision', '--vision-residency', 'overlay', '--vision-max-merged', '12288', ...BONSAI_DF2],
+  },
+  'bonsai2-27b-heretic-vision': {
+    artifact: ART_BONSAI_HERETIC, ctx: 1048576, kv: 1048576, serve: NINFER_CONS_SERVE,
+    reportedId: 'bonsai2-27b-heretic',
+    extra: ['--vision', '--vision-residency', 'overlay', '--vision-max-merged', '12288', ...BONSAI_HERETIC_DF2],
   },
 };
 
@@ -192,6 +256,7 @@ async function loadModelInner(alias) {
   await killPortOwner();
   await waitPortFree();
 
+  const serve = cfg.serve || NINFER_SERVE;
   const args = [cfg.artifact, '--host', '127.0.0.1', '--port', String(CHILD_PORT),
                 '--max-context', String(cfg.ctx), '--kv-capacity', String(cfg.kv), ...cfg.extra];
 
@@ -211,7 +276,7 @@ async function loadModelInner(alias) {
 
     const childLogFd = fs.openSync(CHILD_LOG, 'a');
     fs.writeSync(childLogFd, `\n===== spawn ${alias} (attempt ${attempt}) @ ${new Date().toISOString()} =====\n`);
-    child = spawn(NINFER_SERVE, args, { stdio: ['ignore', childLogFd, childLogFd], detached: false });
+    child = spawn(serve, args, { stdio: ['ignore', childLogFd, childLogFd], detached: false });
     child.on('exit', (code) => {
       try { fs.closeSync(childLogFd); } catch (e) {}
       fs.appendFileSync(CHILD_LOG, `===== exit ${alias} code ${code} @ ${new Date().toISOString()} =====\n`);
@@ -282,17 +347,41 @@ function resolveAlias(raw) {
   return DEFAULT_MODEL; // single-model stack: unknown names get the base profile
 }
 
-// NInfer's embedded chat template only supports reasoning effort
-// none/low/medium/xhigh — it 400s on minimal/high/max. Translate here so
-// clients tuned for bigger providers keep working.
-function normalizeReasoningEffort(body) {
+// Two upstream-body rewrites the children need:
+// - NInfer's embedded chat template only supports reasoning effort
+//   none/low/medium/xhigh — it 400s on minimal/high/max. Translate here so
+//   clients tuned for bigger providers keep working.
+// - The consolidated server validates the request 'model' against its reported
+//   id; Orca ignores it. Profiles with reportedId get body.model rewritten so
+//   alias names (e.g. bonsai2-27b-vision) don't trip the check.
+function normalizeUpstreamBody(body, cfg) {
   try {
     const data = JSON.parse(body);
+    let changed = false;
     const REWRITE = { minimal: 'low', high: 'xhigh', max: 'xhigh' };
     if (typeof data.reasoning_effort === 'string' && REWRITE[data.reasoning_effort]) {
       data.reasoning_effort = REWRITE[data.reasoning_effort];
-      return JSON.stringify(data);
+      changed = true;
     }
+    if (cfg && cfg.reportedId && data.model !== cfg.reportedId) {
+      data.model = cfg.reportedId;
+      changed = true;
+    }
+    // vLLM-alias clash: assistant messages may carry `reasoning` and
+    // `reasoning_content`; the engine 400s when both exist with different
+    // values (some clients emit both and they drift). Engine prefers
+    // `reasoning` — drop the legacy alias on conflict.
+    let dropped = 0;
+    for (const m of (data.messages || [])) {
+      if (m && m.role === 'assistant' &&
+          typeof m.reasoning === 'string' && typeof m.reasoning_content === 'string' &&
+          m.reasoning && m.reasoning_content && m.reasoning !== m.reasoning_content) {
+        delete m.reasoning_content;
+        dropped++; changed = true;
+      }
+    }
+    if (dropped) console.log('ninfer-ctl: dropped conflicting reasoning_content on ' + dropped + ' assistant message(s)');
+    if (changed) return JSON.stringify(data);
   } catch (e) {}
   return body;
 }
@@ -320,6 +409,14 @@ function proxy(req, res) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // Open liveness only; everything else requires the key when one is set.
+  if (req.method !== 'GET' || (req.url !== '/health' && req.url !== '/')) {
+    if (!authorized(req)) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      return res.end('{"error":"unauthorized"}');
+    }
+  }
+
   if (req.method === 'POST' && (req.url.startsWith('/v1/chat/completions') || req.url.startsWith('/v1/messages'))) {
     let body = '';
     let responded = false;
@@ -335,7 +432,7 @@ const server = http.createServer(async (req, res) => {
         await ensureChildHealthy();
         inFlight++;
         res.on('close', () => { inFlight--; });
-        const upstreamBody = normalizeReasoningEffort(body);
+        const upstreamBody = normalizeUpstreamBody(body, MODELS[model]);
         const sendUpstream = (attempt) => {
           const p = http.request(proxyTarget + req.url, { method: 'POST', headers: { ...req.headers, 'content-length': Buffer.byteLength(upstreamBody), 'connection': 'close' }, agent: false }, (pr) => {
             guard(() => { res.writeHead(pr.statusCode, stripHopHeaders(pr.headers)); });
@@ -367,11 +464,24 @@ const server = http.createServer(async (req, res) => {
       object: 'model',
       created,
       owned_by: 'ninfer-ctl',
-      // Advertise the real per-request context limit in both common fields:
-      // max_model_len (vLLM/llama.cpp, matches ninfer-serve's own listing) and
-      // context_length (OpenRouter convention read by many agent harnesses).
+      // Advertise the real per-request context limit in the three common field
+      // names: max_model_len (vLLM/llama.cpp), context_length (OpenRouter), and
+      // context_window (DSH/LiteLLM-style harnesses).
       max_model_len: cfg.ctx,
       context_length: cfg.ctx,
+      context_window: cfg.ctx,
+      // Reasoning effort: the embedded Qwen template natively implements only
+      // low/medium/xhigh (template default xhigh when the field is omitted);
+      // 'none' is handled at protocol level and disables thinking. The
+      // controller additionally translates minimal→low, high→xhigh, max→xhigh
+      // so those wire values are accepted but are NOT distinct levels.
+      reasoning_efforts: ['none', 'low', 'medium', 'xhigh'],
+      default_reasoning_effort: 'xhigh',
+      reasoning_effort_aliases: { minimal: 'low', high: 'xhigh', max: 'xhigh' },
+      supported_parameters: ['reasoning_effort', 'temperature', 'top_p', 'top_k',
+        'min_p', 'presence_penalty', 'frequency_penalty', 'seed', 'stop',
+        'max_tokens', 'chat_template_kwargs'],
+      vision: cfg.extra.includes('--vision'),
     }));
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ object: 'list', data }));
@@ -381,6 +491,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && req.url.startsWith('/yield')) {
     await killChild();
     res.writeHead(200); res.end('{"yielded":true}');
+    return;
+  }
+
+  if (req.method === 'POST' && req.url.startsWith('/stop')) {
+    res.writeHead(200); res.end('{"stopping":true}');
+    setTimeout(async () => { try { await killChild(); } catch (e) {} process.exit(0); }, 100);
     return;
   }
 
@@ -395,7 +511,9 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end('not found');
 });
 
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`ninfer-ctl on :${PORT} — models: ${Object.keys(MODELS).join(', ')}`);
+server.listen(PORT, BIND, () => {
+  console.log(`ninfer-ctl on ${BIND}:${PORT} — models: ${Object.keys(MODELS).join(', ')}`);
+  console.log(API_KEY ? 'API key active — auth required on all routes except GET /health.'
+                      : 'No API key — loopback only.');
   console.log('Ready. Auto-swaps on model name; POST /yield frees VRAM.');
 });
