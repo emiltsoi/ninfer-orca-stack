@@ -17,6 +17,6 @@ if %errorlevel%==0 (
 )
 
 echo Starting ninfer-ctl (detached)...
-powershell -Command "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{CommandLine='cmd /c node %~dp0ninfer-ctl.js > %~dp0ninfer-ctl.log 2>&1'}; if ($r.ReturnValue -eq 0) { Write-Output ('started PID ' + $r.ProcessId) } else { Write-Output ('FAILED ' + $r.ReturnValue) }"
+powershell -Command "$si = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); $si.ShowWindow = 0; $r = Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList 'cmd /c node %~dp0ninfer-ctl.js > %~dp0ninfer-ctl.log 2>&1', $null, $si; if ($r.ReturnValue -eq 0) { Write-Output ('started PID ' + $r.ProcessId) } else { Write-Output ('FAILED ' + $r.ReturnValue) }"
 echo Health: http://<your-host>:%NINFER_PORT%/health
 echo Models: qwen-3.8-orca, qwen-3.8-orca-fast, qwen-3.8-orca-vision, qwen-3.8-orca-vision-fast
